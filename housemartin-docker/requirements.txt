@@ -1,0 +1,10 @@
+playwright==1.44.0
+python-dotenv==1.0.1
+yfinance==0.2.66
+numpy-financial==1.0.0
+pandas==2.2.2
+requests==2.32.3
+scipy
+google-auth
+google-auth-httplib2
+google-api-python-client

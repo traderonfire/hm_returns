@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  housemartin-scraper:
+    image: housemartin-scraper:latest
+    container_name: housemartin-scraper
+
+    # The container is ephemeral — it runs, writes files, then exits.
+    restart: "no"
+
+    # ── Security: Chromium needs these to run in a container ─────────────────
+    security_opt:
+      - seccomp:unconfined   # required for Chromium sandbox
+    shm_size: "256m"         # Chromium uses /dev/shm heavily; default 64mb is too small
+
+    # ── Environment ──────────────────────────────────────────────────────────
+    env_file:
+      - .env                 # credentials — never commit this file
+
+    environment:
+      # run_scraper.py chdirs here before calling your scripts
+      - WORK_DIR=/dropbox_data
+      # Do NOT set PLAYWRIGHT_BROWSERS_PATH — Playwright installed Chromium to
+      # /root/.cache/ms-playwright inside the image; overriding the path breaks it.
+
+    # ── Volumes ──────────────────────────────────────────────────────────────
+    volumes:
+      # Quotes are required — spaces in the path confuse docker compose variable
+      # interpolation and produce "fBkv not set" warnings without them.
+      - "${DROPBOX_DIR}:/dropbox_data"
+      - "${COMPOSE_DIR}/service_account.json:/app/service_account.json:ro"
+    # DO NOT set working_dir — Python would look for run_scraper.py in /dropbox_data
+    # instead of /app. run_scraper.py calls os.chdir(WORK_DIR) itself after starting.
