@@ -59,6 +59,84 @@ def step(n, desc):
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 
+def calculate_twrr(history_csv: Path, sub_account_keys: list[str]) -> dict:
+    """
+    Calculate cumulative True Time-Weighted Rate of Return (TWRR) from
+    hm_history.csv for the portfolio and each sub-account.
+
+    Portfolio TWRR = (hmfund_nav / 100) - 1  (direct from NAV chain)
+
+    Per-account TWRR chains sub-period returns:
+        r_t = (val_t - net_dep_t) / val_{t-1} - 1
+        net_dep_t = delta_val_t - delta_pnl_t  (change in value minus change in pnl)
+        TWRR = ∏(1 + r_t) - 1
+
+    Returns {acc_key: twrr_float, 'portfolio': twrr_float}
+    where acc_key matches the pattern '{holder}_{label}' used in history columns.
+    Missing / insufficient data returns None for that key.
+    """
+    if not history_csv.exists():
+        return {}
+    try:
+        import pandas as _pd
+        hist = _pd.read_csv(history_csv, parse_dates=["date"],
+                            dayfirst=True, infer_datetime_format=True)
+        hist = hist.sort_values("date").reset_index(drop=True)
+        if len(hist) < 2:
+            return {}
+    except Exception:
+        return {}
+
+    result = {}
+
+    # Per-account TWRR: assume global TWRR (from NAV) up to the first history row
+    # for that account, then chain-link from there using daily sub-period returns.
+    # This gives a meaningful figure even when account history starts mid-way through.
+    nav_col = next((c for c in ["NAV", "hmfund_nav"] if c in hist.columns), None)
+    for acc_key in sub_account_keys:
+        val_col = f"{acc_key}_final_value"
+        pnl_col = f"{acc_key}_pnl"
+        if val_col not in hist.columns or pnl_col not in hist.columns:
+            result[acc_key] = None
+            continue
+        cols = [val_col, pnl_col] + ([nav_col] if nav_col else [])
+        sub  = hist[cols].dropna()
+        if sub.empty:
+            result[acc_key] = None
+            continue
+        if len(sub) < 2:
+            # Only one row — fall back to simple total return
+            val = sub[val_col].iloc[0]
+            pnl = sub[pnl_col].iloc[0]
+            ni  = val - pnl
+            result[acc_key] = (pnl / ni) if ni > 0 else None
+            continue
+
+        # Global TWRR assumption up to first account row
+        if nav_col and nav_col in sub.columns:
+            nav_first = sub[nav_col].iloc[0]
+            prior = (nav_first / 100 - 1) if nav_first and nav_first > 0 else 0.0
+        else:
+            prior = 0.0
+
+        # Chain-link from first account row onward
+        cumulative = 1.0
+        for i in range(1, len(sub)):
+            val_prev = sub[val_col].iloc[i - 1]
+            val_t    = sub[val_col].iloc[i]
+            pnl_prev = sub[pnl_col].iloc[i - 1]
+            pnl_t    = sub[pnl_col].iloc[i]
+            if val_prev <= 0:
+                continue
+            net_dep = (val_t - val_prev) - (pnl_t - pnl_prev)
+            r_t     = (val_t - net_dep) / val_prev - 1
+            cumulative *= (1 + r_t)
+
+        result[acc_key] = (1 + prior) * cumulative - 1
+
+    return result
+
+
 def main():
     skip_scrape = "--skip-scrape" in sys.argv
     headless    = "--visible"     not in sys.argv
@@ -226,6 +304,23 @@ def main():
     except Exception:
         pp_nav_today = None
 
+    # Portfolio TWRR from NAV chain; per-account TWRR from history CSV.
+    # sa['label'] is the full site string e.g. "Regular account" / "ISA account".
+    # History CSV uses {HOLDER}_{reg|ISA} e.g. A1_reg, A1_ISA.
+    def _hist_key(sa):
+        lbl = sa['label'].lower()
+        suffix = "ISA" if "isa" in lbl else "reg"
+        return f"{sa['holder']}_{suffix}"
+
+    sa_keys  = [_hist_key(sa) for sa in sub_account_results]
+    twrr_map     = calculate_twrr(SNAPSHOTS_DIR / "hm_history.csv", sa_keys)
+    # Portfolio TWRR: prefer NAV-derived if available, else from twrr_map
+    portfolio_twrr = (pp_nav_today / 100 - 1) if pp_nav_today and pp_nav_today > 0 else twrr_map.get("portfolio")
+    print(f"  TWRR           : {portfolio_twrr * 100:.2f}%" if portfolio_twrr is not None else "  TWRR: N/A")
+    # Attach per-account TWRR to sub_account_results
+    for sa in sub_account_results:
+        sa["twrr"] = twrr_map.get(_hist_key(sa))
+
     # ── Step 4: Generate HTML report ──────────────────────────────────────────
     step(4, "Generating HTML report")
 
@@ -239,6 +334,7 @@ def main():
         current_value    = current_value,
         pnl              = pnl,
         total_return     = total_return,
+        portfolio_twrr   = portfolio_twrr,
         benchmarks       = benchmarks,
         account_balances = account_results,
         sub_accounts     = sub_account_results,
@@ -330,25 +426,15 @@ def main():
 
     txt_content = "\n".join(lines)
 
-    # Save timestamped txt snapshot
-    txt_path = SNAPSHOTS_DIR / f"hm_snapshot_{ts_str}.txt"
-    txt_path.write_text(txt_content, encoding="utf-8")
-    try:
-        with open(txt_path, "rb") as f:
-            os.fsync(f.fileno())
-    except OSError:
-        pass
-    print(f"  → Snapshot txt : {txt_path}")
-
     # ── Append to CSV history ─────────────────────────────────────────────────
     import csv
     csv_path = SNAPSHOTS_DIR / "hm_history.csv"
     
     # Build header + row
     base_fields = ["date", "net_investment", "pnl", "final_value",
-                   "total_return_pct", "irr_pct",
+                   "total_return_pct", "irr_pct", "twrr_pct",
                    "avg_time_held_days", "net_time_weighted_investment",
-                   "hmfund_nav"]
+                   "NAV"]
     bench_fields = []
     for b in benchmarks:
         t = b["ticker"].replace(".", "_")
@@ -361,7 +447,8 @@ def main():
     for sa in sub_account_results:
         key = f"{sa['holder']}_{sa['label']}".replace(" ", "_")
         sa_fields += [f"{key}_value", f"{key}_pnl",
-                      f"{key}_total_return_pct", f"{key}_irr_pct"]
+                      f"{key}_total_return_pct", f"{key}_irr_pct",
+                      f"{key}_twrr_pct"]
     all_fields = base_fields + bench_fields + acct_fields + sa_fields
 
     row = {
@@ -371,9 +458,10 @@ def main():
         "final_value":                 round(current_value, 2),
         "total_return_pct":            round(total_return * 100, 4) if total_return else None,
         "irr_pct":                     round(irr_result * 100, 4)   if irr_result   else None,
+        "twrr_pct":                    round(portfolio_twrr * 100, 4) if portfolio_twrr is not None else None,
         "avg_time_held_days":          td.days if td else None,
         "net_time_weighted_investment": round(net_twi, 2),
-        "hmfund_nav":                  round(pp_nav_today, 6) if pp_nav_today else None,
+        "NAV":                         round(pp_nav_today, 6) if pp_nav_today else None,
     }
     for b in benchmarks:
         t = b["ticker"].replace(".", "_")
@@ -390,6 +478,7 @@ def main():
         row[f"{key}_pnl"]              = round(sa["pnl"], 2)           if sa["pnl"]           is not None else None
         row[f"{key}_total_return_pct"] = round(sa["total_return"] * 100, 4) if sa["total_return"] is not None else None
         row[f"{key}_irr_pct"]          = round(sa["irr"] * 100, 4)    if sa["irr"]           is not None else None
+        row[f"{key}_twrr_pct"]         = round(sa["twrr"] * 100, 4)   if sa.get("twrr")      is not None else None
 
     write_header = not csv_path.exists()
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
@@ -413,6 +502,7 @@ def main():
             current_value       = current_value,
             pnl                 = pnl,
             total_return        = total_return,
+            portfolio_twrr      = portfolio_twrr,
             irr                 = irr_result,
             account_results     = account_results,
             sub_account_results = sub_account_results,
@@ -432,7 +522,7 @@ def main():
         else:
             # Map sub_account_results to pp_index acc_keys
             # acc_key format: {HOLDER_INITIAL}_{reg|isa}
-            # e.g. holder="MP", label="Regular account" → "MP_reg"
+            # e.g. holder="A1", label="Regular account" → "A1_reg"
             acct_vals = {}
             acct_ni   = {}
             for sa in sub_account_results:
@@ -444,9 +534,12 @@ def main():
                     acc_key = f"{holder}_isa"
                 else:
                     continue
-                if sa.get("current_value"):
+                if sa.get("current_value") and sa.get("pnl") is not None:
                     acct_vals[acc_key] = sa["current_value"]
-                    acct_ni[acc_key]   = sa.get("net_investment") or 0.0
+                    # Compute gross invested = current_value - pnl.
+                    # This is pure deposited capital, independent of irr5 internals,
+                    # and matches the basis used in hm_history.csv and the seed.
+                    acct_ni[acc_key] = sa["current_value"] - sa["pnl"]
 
             # Compute today's chain-linked NAV from portfolio-level figures
             pp_nav = compute_daily_nav(
@@ -473,7 +566,6 @@ def main():
     print(f"\n{'=' * 55}")
     print("  ✓  All done!")
     print(f"  Report   : {report_filename}")
-    print(f"  Snapshot : {txt_path}")
     print(f"  History  : {csv_path}")
     print(f"  Sheet    : {os.getenv('GSHEET_ID', '(GSHEET_ID not set)')} → {os.getenv('GSHEET_SHEET_NAME', 'HM')}")
     print(f"  PP index : HM_prices_portfolio + per-account + HM_transactions")
@@ -483,7 +575,7 @@ def main():
     # Cloud Sync (which watches mtime) picks them up after the run completes.
     import time
     time.sleep(2)   # let any pending I/O settle first
-    for f in [report_filename, latest_report, txt_path, csv_path]:
+    for f in [report_filename, latest_report, csv_path]:
         try:
             p = Path(f)
             if p.exists():
@@ -502,7 +594,7 @@ def _load_staging_results(from_sheets: bool = False):
     and pair them with balances — either from Google Sheets or entered manually.
 
     Sheet matching: the sheet's Account column must contain the account name
-    (e.g. "MP", "EH", "TC") — case-insensitive partial match is fine.
+    (e.g. "A1", "A2", "A3") — case-insensitive partial match is fine.
     """
     staging = STAGING_DIR
     # Only pick up the "all accounts" CSVs (not sub-account files)

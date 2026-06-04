@@ -13,8 +13,8 @@ deposit/withdrawal size effects.
 Starting point: 2023-08-30, NAV=100.0, units = Value/100 = 7594.46
 
 Outputs (local CSV + Google Sheets):
-  hmfund_quotes.csv          — Date;Close
-  hmfund_transactions_seed.csv — Date;Type;Value;Shares;Quote;Account;Portfolio
+  hmfund_quotes.csv          — Date,Close
+  hmfund_transactions_seed.csv — Date,Type,Value,Shares,Quote,ISIN,Ticker Symbol,Securities Account
   hm_pp_state.json           — running state for daily incremental updates
 """
 
@@ -34,6 +34,7 @@ STARTING_NAV  = 100.0
 STARTING_DATE = pd.Timestamp(os.getenv("PP_STARTING_DATE", "2023-01-01"))
 SPLIT_DATE    = pd.Timestamp(os.getenv("PP_SPLIT_DATE",    "2026-03-14"))
 STATE_FILE   = HERE / "hm_pp_state.json"
+BACKUP_FILE  = HERE / "hm_pp_state.backup.json"
 QUOTES_FILE  = HERE / "hmfund_quotes.csv"
 TXN_FILE     = HERE / "hmfund_transactions_seed.csv"
 
@@ -81,16 +82,19 @@ def _build_accounts() -> dict:
             #   {NAME}_reg_final_value  or  {NAME}_ISA_final_value
             sub_col = "ISA" if sub == "isa" else sub
             hist_val  = f"{name}_{sub_col}_final_value"
+            hist_pnl  = f"{name}_{sub_col}_pnl"
             hist_xirr = f"{name}_{sub_col}_XIRR"
             # Staging CSV filename
             sub_file = "isa" if sub == "isa" else "regular"
             csv_file  = f"{name}_{sub_file}_acc.csv"
-            # PP display name
-            sec_acc   = f"{pp_prefix} {sub.upper()}"
+            # PP display name — ISA stays all-caps, other types are title-cased
+            sub_label = sub.upper() if sub.lower() == "isa" else sub.title()
+            sec_acc   = f"{pp_prefix} {sub_label}"
 
             accounts[acc_key] = {
                 "securities_account": sec_acc,
                 "hist_val":           hist_val,
+                "hist_pnl":           hist_pnl,
                 "hist_xirr":          hist_xirr,
                 "csv_file":           csv_file,
                 "pp_account":         sec_acc,
@@ -413,38 +417,47 @@ def build_rebalance_transactions(hist_df: pd.DataFrame,
     """
     Post-split transactions from hm_history.csv.
 
-    hist_end_units: {acc_key: units} — units held at end of pre-split period,
-    passed in from build_historical_transactions so there is no double-counting
-    on SPLIT_DATE.
+    hist_end_units: {acc_key: units} — units held at end of pre-split period.
 
-    For each day:
-      1. If net_invested changed → external flow Buy/Sell at NAV
-      2. Performance rebalance on residual delta_units (net cash = 0):
-           Buy  units_new_perf at NAV
-           Sell units_old      at val_perf / units_old
-         where val_perf = units_new_perf * NAV  (stripping the flow)
+    For each day, two transactions per account:
+      Buy:  today's full value at today's NAV  → establishes correct unit count
+      Sell: previous units at (today_value − delta_ni) / prev_units
+            → captures pure performance; deposit/withdrawal stripped from P&L
+
+    delta_ni is derived from the total portfolio net_invested column, allocated
+    to individual accounts by comparing each account's value change against the
+    expected pure-performance change. Accounts whose value change matches pure
+    NAV performance get delta_ni=0; any residual in the total is assigned to the
+    account(s) that show an anomalous value change.
     """
     txns       = []
     per_acct   = hist_df[hist_df.date >= SPLIT_DATE].sort_values("date").reset_index(drop=True)
-
-    # Build ni_prev lookup — need net_invested per account per day.
-    # We don't have per-account NI directly; approximate from the ratio of
-    # account value to total portfolio value × total NI.
-    # For flow detection we compare day-to-day deltas; small noise is fine.
     total_ni_col = "net_invested" if "net_invested" in hist_df.columns else None
 
-    # prev_state: acc_key -> {units, ni_approx}
-    prev_state = {k: {"units": v, "ni_approx": None}
+    # prev_state: acc_key -> {units, val}
+    prev_state = {k: {"units": v, "ni": None}
                   for k, v in hist_end_units.items()}
 
+    prev_total_ni = None
+
     for _, row in per_acct.iterrows():
-        nav       = get_nav_on(nav_series, row.date)
-        total_ni  = float(row[total_ni_col]) if total_ni_col else None
-        total_val = sum(
-            float(row[acc["hist_val"]])
-            for acc in ACCOUNTS.values()
-            if acc["hist_val"] in row.index and not pd.isna(row[acc["hist_val"]])
-        )
+        nav        = get_nav_on(nav_series, row.date)
+        total_ni   = float(row[total_ni_col]) if total_ni_col else None
+
+        # Total deposit/withdrawal today across whole portfolio
+        delta_ni_total = 0.0
+        if total_ni is not None and prev_total_ni is not None:
+            delta_ni_total = total_ni - prev_total_ni
+
+        # Per-account NI = final_value - pnl (exact, no approximation needed)
+        # delta_ni per account derived from day-to-day change in this figure.
+        acct_ni_today = {}
+        for acc_key, acc in ACCOUNTS.items():
+            vcol = acc["hist_val"]
+            pcol = acc["hist_pnl"]
+            if vcol in row.index and pcol in row.index \
+                    and not pd.isna(row[vcol]) and not pd.isna(row[pcol]):
+                acct_ni_today[acc_key] = float(row[vcol]) - float(row[pcol])
 
         for acc_key, acc in ACCOUNTS.items():
             vcol = acc["hist_val"]
@@ -456,15 +469,14 @@ def build_rebalance_transactions(hist_df: pd.DataFrame,
             units_today = val_today / nav
             sec_acc     = acc["securities_account"]
 
-            # Approximate per-account NI as proportional share of total NI
-            if total_ni and total_val and total_val > 0:
-                ni_today = total_ni * (val_today / total_val)
-            else:
-                ni_today = val_today
+            ps        = prev_state.get(acc_key, {})
+            units_old = ps.get("units", 0.0)
+            ni_old    = ps.get("ni", None)
+            ni_today  = acct_ni_today.get(acc_key)
 
-            if acc_key not in prev_state or prev_state[acc_key]["units"] == 0:
-                # No prior holding — opening buy at NAV
-                prev_state[acc_key] = {"units": units_today, "ni_approx": ni_today}
+            if units_old < 0.0001:
+                # Opening buy — no prior holding
+                prev_state[acc_key] = {"units": units_today, "ni": ni_today}
                 txns.append({"date": row.date, "type": "Buy",
                              "value": round(val_today, 2),
                              "shares": round(units_today, 6),
@@ -472,42 +484,41 @@ def build_rebalance_transactions(hist_df: pd.DataFrame,
                              "securities_account": sec_acc})
                 continue
 
-            prev       = prev_state[acc_key]
-            units_old  = prev["units"]
-            ni_old     = prev["ni_approx"] if prev["ni_approx"] is not None else ni_today
-
-            delta_ni    = ni_today - ni_old
-            delta_units = units_today - units_old
-
-            # 1. External cash flow at NAV
-            if abs(delta_ni) > 1.0:
-                ext_units = delta_ni / nav
-                kind = "Buy" if delta_ni > 0 else "Sell"
-                txns.append({"date": row.date, "type": kind,
-                             "value": round(abs(delta_ni), 2),
-                             "shares": round(abs(ext_units), 6),
-                             "quote": round(nav, 6),
-                             "securities_account": sec_acc})
-                units_after_flow = units_old + ext_units
+            # Per-account delta_ni from exact NI figures (val - pnl)
+            if ni_today is not None and ni_old is not None:
+                delta_ni = ni_today - ni_old
             else:
-                ext_units        = 0.0
-                units_after_flow = units_old
+                delta_ni = 0.0
 
-            # 2. Performance rebalance (net cash = 0)
-            rebal_delta = units_today - units_after_flow
-            if abs(rebal_delta) > 0.0001 and units_after_flow > 0.0001:
-                val_perf = units_today * nav   # performance-only value
-                p_sell   = val_perf / units_after_flow
-                txns += [
-                    {"date": row.date, "type": "Buy",
-                     "value": round(val_perf, 2), "shares": round(units_today, 6),
-                     "quote": round(nav, 6), "securities_account": sec_acc},
-                    {"date": row.date, "type": "Sell",
-                     "value": round(val_perf, 2), "shares": round(units_after_flow, 6),
-                     "quote": round(p_sell, 6), "securities_account": sec_acc},
-                ]
+            # Two-transaction scheme — always sell all previous units.
+            # sell_proceeds = val - delta_ni strips the flow (deposit or withdrawal)
+            # from P&L. units_sell = units_old always: for ISA transfers/withdrawals,
+            # units move across accounts rather than being redeemed at a prior price,
+            # so adjusting units_sell would distort the sell quote.
+            sell_proceeds = round(val_today - delta_ni, 2)
+            sell_quote    = round(sell_proceeds / units_old, 6)
+            buy_val       = round(val_today, 2)
+            buy_units     = round(units_today, 6)
+            sell_units    = round(units_old, 6)
+            buy_quote     = round(nav, 6)
 
-            prev_state[acc_key] = {"units": units_today, "ni_approx": ni_today}
+            if (buy_val == sell_proceeds and buy_units == sell_units
+                    and buy_quote == sell_quote):
+                prev_state[acc_key] = {"units": units_today, "ni": ni_today}
+                continue
+
+            txns += [
+                {"date": row.date, "type": "Buy",
+                 "value": buy_val, "shares": buy_units, "quote": buy_quote,
+                 "securities_account": sec_acc},
+                {"date": row.date, "type": "Sell",
+                 "value": sell_proceeds, "shares": sell_units, "quote": sell_quote,
+                 "securities_account": sec_acc},
+            ]
+
+            prev_state[acc_key] = {"units": units_today, "ni": ni_today}
+
+        prev_total_ni = total_ni
 
     return txns
 
@@ -570,7 +581,7 @@ def build_and_push(work_dir: Path = None):
     quotes_df["date"] = quotes_df["date"].dt.strftime("%Y-%m-%d")
     quotes_df.columns = ["Date","Close"]
     quotes_df["Close"] = quotes_df["Close"].round(4)
-    quotes_df.to_csv(QUOTES_FILE, sep=";", index=False)
+    quotes_df.to_csv(QUOTES_FILE, sep=",", index=False)
     print(f"  → Quotes: {QUOTES_FILE} ({len(quotes_df)} rows)")
 
     # Transactions — historical seed (approach 3) + post-split rebalances
@@ -586,8 +597,8 @@ def build_and_push(work_dir: Path = None):
     txn_df["ticker"] = HMFUND_TICKER
     # Reorder columns to PP import format
     txn_df = txn_df[["date","type","value","shares","quote","isin","ticker","securities_account"]]
-    txn_df.columns   = ["Date","Type","Value","Shares","Quote","ISIN","Ticker","Securities Account"]
-    txn_df.to_csv(TXN_FILE, sep=";", index=False)
+    txn_df.columns   = ["Date","Type","Value","Shares","Quote","ISIN","Ticker Symbol","Securities Account"]
+    txn_df.to_csv(TXN_FILE, sep=",", index=False)
     print(f"  → Transactions: {TXN_FILE} ({len(txn_df)} rows)")
 
     # State file
@@ -607,6 +618,9 @@ def build_and_push(work_dir: Path = None):
             v = float(last_hist[vcol])
             state["units"][acc_key]  = round(v / nav_last, 6)
             state["acct_ni"][acc_key] = round(v, 2)
+    import shutil as _shutil
+    if STATE_FILE.exists():
+        _shutil.copy2(STATE_FILE, BACKUP_FILE)
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
     print(f"  → State: {STATE_FILE}")
@@ -649,41 +663,59 @@ def daily_update(work_dir: Path = None, *, nav: float, date_str: str,
         units_today = val / nav
         units_prev  = prev.get("units", {}).get(acc_key, 0.0)
         ni_prev     = prev.get("acct_ni", {}).get(acc_key, 0.0)
-        delta_ni    = ni - ni_prev
-        delta_units = units_today - units_prev
-        pp_acc      = acc["pp_account"]
-        cash        = acc["pp_cash"]
+        delta_ni    = ni - ni_prev      # deposit (+) or withdrawal (-) today
+        sec_acc     = acc["securities_account"]
 
-        # External flow — Buy/Sell at NAV only (no Deposit/Removal)
-        sec_acc = acc["securities_account"]
-        if abs(delta_ni) > 1.0:
-            ext_units   = delta_ni / nav
-            rebal_units = delta_units - ext_units
-            kind = "Buy" if delta_ni > 0 else "Sell"
-            txns.append({"date": date_str, "type": kind,
-                         "value": round(abs(delta_ni), 2),
-                         "shares": round(abs(ext_units), 6),
-                         "quote": round(nav, 6),
-                         "securities_account": sec_acc})
-        else:
-            rebal_units = delta_units
+        # ── Two-transaction scheme ────────────────────────────────────────
+        # Buy:  today's full value at today's NAV  → establishes new unit count
+        # Sell: previous units at a price that captures pure performance only
+        #       sell_proceeds = today_value − delta_ni  (deposit/withdrawal not P&L)
+        #       sell_quote    = sell_proceeds / units_prev
+        #
+        # On a pure-performance day (delta_ni ≈ 0):
+        #   sell_proceeds = today_value  →  sell_quote reflects actual movement
+        # On a deposit day:
+        #   sell_proceeds strips the deposit so P&L is unaffected
+        # On a withdrawal day:
+        #   delta_ni < 0  →  sell_proceeds > today_value  (correct, mirrors inflow)
+        #
+        # Net cash = buy_value − sell_proceeds = delta_ni  (matches actual flow)
+        # Robust to inaccuracies in delta_ni: even if delta_ni drifts slightly,
+        # the unit count (val/nav) is always correct and P&L tracks NAV movement.
 
-        # ── Two-leg performance rebalance, net cash = 0 ─────────────────
-        # Use performance-only value (strip the flow) so P&L is not distorted
-        sec_acc         = acc["securities_account"]
-        units_new_final = units_prev + rebal_units  # after stripping ext flow
-        if abs(rebal_units) > 0.0001 and units_prev > 0.0001:
-            units_after_flow = units_prev + (ext_units if abs(delta_ni) > 1.0 else 0.0)
-            val_perf = units_new_final * nav
-            p_sell   = val_perf / units_after_flow if units_after_flow > 0 else nav
+        if units_prev > 0.0001:
+            # Always sell all previous units; sell_proceeds = val - delta_ni
+            # strips the flow from P&L whether deposit or withdrawal.
+            sell_proceeds = round(val - delta_ni, 2)
+            sell_quote    = round(sell_proceeds / units_prev, 6)
+            buy_val       = round(val, 2)
+            buy_units     = round(units_today, 6)
+            sell_units    = round(units_prev, 6)
+            buy_quote     = round(nav, 6)
+
+            # Skip if buy and sell are identical — happens when NAV is unchanged
+            # and there's no flow (e.g. re-run on same day with same scraped values).
+            # Identical pairs produce zero P&L and zero net units change, so they
+            # are noise in PP and should not be recorded.
+            if (buy_val == sell_proceeds and buy_units == sell_units
+                    and buy_quote == sell_quote):
+                continue
+
             txns += [
                 {"date": date_str, "type": "Buy",
-                 "value": round(val_perf, 2), "shares": round(units_new_final, 6),
-                 "quote": round(nav, 6), "securities_account": sec_acc},
+                 "value": buy_val, "shares": buy_units, "quote": buy_quote,
+                 "securities_account": sec_acc},
                 {"date": date_str, "type": "Sell",
-                 "value": round(val_perf, 2), "shares": round(units_after_flow, 6),
-                 "quote": round(p_sell, 6), "securities_account": sec_acc},
+                 "value": sell_proceeds, "shares": sell_units, "quote": sell_quote,
+                 "securities_account": sec_acc},
             ]
+        else:
+            # First day for this account — opening Buy only
+            txns.append({"date": date_str, "type": "Buy",
+                         "value": round(val, 2),
+                         "shares": round(units_today, 6),
+                         "quote": round(nav, 6),
+                         "securities_account": sec_acc})
 
         prev.setdefault("units",{})[acc_key]   = round(units_today, 6)
         prev.setdefault("acct_ni",{})[acc_key] = round(ni, 2)
@@ -703,17 +735,20 @@ def daily_update(work_dir: Path = None, *, nav: float, date_str: str,
     prev["last_date"]    = date_str
     prev["net_invested"] = round(sum(account_net_invested.values()), 2)
     prev["total_units"]  = round(sum(prev["units"].values()), 6)
+    import shutil as _shutil
+    if STATE_FILE.exists():
+        _shutil.copy2(STATE_FILE, BACKUP_FILE)
     with open(STATE_FILE, "w") as f:
         json.dump(prev, f, indent=2)
 
     # Append to local files
     with open(QUOTES_FILE, "a") as f:
-        f.write(f"{date_str};{round(nav,4)}\n")
+        f.write(f"{date_str},{round(nav,4)}\n")
     if txns:
         with open(TXN_FILE, "a") as f:
             for t in txns:
-                f.write(f"{t['date']};{t['type']};{t['value']};{t['shares']};"
-                        f"{t['quote']};{HMFUND_ISIN};{HMFUND_TICKER};"
+                f.write(f"{t['date']},{t['type']},{t['value']},{t['shares']},"
+                        f"{t['quote']},{HMFUND_ISIN},{HMFUND_TICKER},"
                         f"{t['securities_account']}\n")
         print(f"  → {len(txns)} PP transactions for {date_str}")
     else:
@@ -723,8 +758,8 @@ def daily_update(work_dir: Path = None, *, nav: float, date_str: str,
     if SHEET_ID:
         try:
             svc       = _get_service()
-            quotes_df = pd.read_csv(QUOTES_FILE, sep=";")
-            txn_df    = pd.read_csv(TXN_FILE,    sep=";")
+            quotes_df = pd.read_csv(QUOTES_FILE, sep=",")
+            txn_df    = pd.read_csv(TXN_FILE,    sep=",")
             write_sheet(svc, "HM_pp_quotes",       quotes_df)
             write_sheet(svc, "HM_pp_transactions",  txn_df)
         except Exception as e:
