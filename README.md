@@ -105,9 +105,10 @@ Passwords containing `$` or other special characters should be wrapped in single
 ## Usage
 
 ```bash
-python run.py              # normal headless run
-python run.py --visible    # browser visible — use when debugging
+python run.py                # normal headless run
+python run.py --visible      # browser visible — use when debugging
 python run.py --skip-scrape  # reuse existing CSVs, enter balances manually
+python run.py --pp-full      # write PP transactions every day (default: cash-flow + month-end only)
 ```
 
 ---
@@ -145,7 +146,7 @@ Three return metrics are calculated and displayed:
 | Metric | What it measures | Notes |
 |--------|-----------------|-------|
 | **Total Return** | `P&L / Net Invested` | Simple return; can become unstable if NI is small or negative |
-| **TWRR** | True Time-Weighted Rate of Return | Strips out deposit/withdrawal timing effects; portfolio-level from HMFUND NAV chain (`NAV/100 - 1`); per-account uses global TWRR assumption pre-history then chains from first recorded row |
+| **TWRR** | True Time-Weighted Rate of Return | Strips out deposit/withdrawal timing effects. Portfolio-level: `NAV/100 - 1` (exact, from the HMFUND chain). Per-account: chain-linked from `hm_history.csv` using `r_t = (val_t − net_deposit_t) / val_{t-1} − 1`, with global TWRR assumed for the pre-history period |
 | **XIRR** | Internal Rate of Return (annualised) | Money-weighted; reflects deposit timing |
 
 ---
@@ -189,18 +190,34 @@ NAV_t    = Value_t / units_t                 # pure performance, no flow distort
 
 ### Daily transaction scheme
 
-Each day, two transactions per account:
+Each recorded day produces two transactions per account:
 
 ```
-Buy:  today's full value at today's NAV           → establishes new unit count
-Sell: (today_value − net_deposit) at prev_units   → captures pure performance, strips flows
+Buy:  today's full value at today's NAV              → establishes new unit count
+Sell: (today_value − net_deposit) at pp_units        → captures pure performance, strips flows
 ```
 
-Where `net_deposit = delta_value − delta_pnl` (change in value minus change in P&L).
+Where `net_deposit = delta_value − delta_pnl` and `pp_units` = the shares PP holds from the last *written* transaction (not the running internal count).
 
 - **Deposit day:** sell proceeds stripped of deposit → no artificial P&L gain
 - **Withdrawal day:** same formula in reverse → no artificial P&L loss
-- **Flat day:** buy and sell are identical → transactions skipped automatically (idempotency)
+- **Flat day:** buy and sell are identical → transactions skipped automatically
+- **Skipped day:** internal state (units, NI) advances silently; `pp_units` stays frozen at the last written value so the next written sell always references shares PP actually holds
+
+### Transaction frequency
+
+By default, transactions are only written on days where they matter for TWRR accuracy:
+
+| Condition | Transactions written |
+|-----------|---------------------|
+| Cash flow detected (`abs(delta_ni) > £10`) | ✓ |
+| Last calendar day of the month | ✓ |
+| `--pp-full` flag | ✓ always |
+| Pure performance day (no flow, not month-end) | ✗ skipped |
+
+The NAV quote is always written to `hmfund_quotes.csv` regardless, keeping the price history continuous.
+
+This reduces the PP database from ~3,650 transaction pairs per account per year to ~30–50, while preserving TWRR accuracy. To regenerate the full history with the lean rules: `python pp_index.py --reseed`. To use daily transactions throughout: `python pp_index.py --reseed --pp-full`.
 
 ### Transaction format
 
@@ -213,7 +230,7 @@ Comma-delimited CSV with columns: `Date,Type,Value,Shares,Quote,ISIN,Ticker Symb
 
 ### State file and recovery
 
-`hm_pp_state.json` stores the last known NAV, total units, net invested, and per-account units/NI. A backup is automatically written to `hm_pp_state.backup.json` before each update. `hm_pp_state_history.csv` keeps a full daily log of all state values for easy manual recovery.
+`hm_pp_state.json` stores the last known NAV, total units, net invested, per-account units/NI, and `pp_units` (the unit count PP holds from the last written transaction — this may differ from `units` on days when transactions are skipped). A backup is automatically written to `hm_pp_state.backup.json` before each update. `hm_pp_state_history.csv` keeps a full daily log of all state values for easy manual recovery.
 
 **To restore state to a previous date:**
 1. Find the target date row in `hm_pp_state_history.csv`
@@ -257,7 +274,13 @@ Produces `hmfund_quotes.csv`, `hmfund_transactions_seed.csv`, `hm_pp_state.json`
 - Create one securities account per sub-account matching names in `.env`
 - Import `HM_pp_transactions` as Portfolio Transactions (comma separator), tick Convert to Delivery
 
-**To re-seed from scratch:** delete `hm_pp_seed_done.flag`, `hmfund_quotes.csv`, `hmfund_transactions_seed.csv`, restore `hm_pp_state.json` to a known-good baseline, then run `python pp_index.py`.
+**To re-seed from scratch:** delete `hm_pp_seed_done.flag`, `hmfund_quotes.csv`, `hmfund_transactions_seed.csv`, restore `hm_pp_state.json` to a known-good baseline, then:
+
+```bash
+python pp_index.py           # lean mode: cash-flow days + month-end only (recommended)
+python pp_index.py --pp-full # write transactions every day
+python pp_index.py --reseed  # force re-seed even if flag file exists
+```
 
 ---
 
@@ -279,7 +302,7 @@ housemartin-docker/
 3. Refreshes `hm_report_latest.html` with a delete+copy to ensure Cloud Sync picks it up
 4. Keeps only the last 30 log files
 
-Edit `COMPOSE_DIR` and `DROPBOX_DIR` in `launch_scraper.sh` to match your NAS paths.
+Set `COMPOSE_DIR` and `DROPBOX_DIR` in your `.env` file (see `.env.example`) — `launch_scraper.sh` reads them automatically, so no manual editing of the script is needed.
 
 **Rebuild the Docker image when:** `requirements.txt` or `Dockerfile` changes. Python files on the mounted volume are picked up without a rebuild.
 
@@ -327,6 +350,9 @@ Check `service_account.json` is present, the sheet is shared with the service ac
 
 **PP transactions are wrong after a failed run**
 Restore `hm_pp_state.json` from `hm_pp_state.backup.json` (or from a row in `hm_pp_state_history.csv`), delete the bad transaction rows from the CSVs, and re-run.
+
+**PP final values differ between abridged and complete transaction sets**
+This was caused by the sell on the first post-skip day using the internal running unit count rather than the units PP actually holds. Fixed in the current version — `pp_units` in state tracks what PP last saw and is used for sell share counts, while the internal `units` continues advancing through skipped days for accurate delta calculations. If you see this with an older transaction file, re-seed with `python pp_index.py --reseed`.
 
 **PP transactions show identical buy/sell pairs**
 This means the pipeline ran twice on the same day with the same values. The idempotency guard in `daily_update()` prevents this on subsequent runs — delete the duplicate rows from the CSV and re-run with the correct state.
