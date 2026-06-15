@@ -274,6 +274,8 @@ def main():
                 sa_cv  = sa_cv_rows.values[0]
                 sa_pnl = sa_cv - sa_ni
                 sa_ret = sa_pnl / sa_ni if sa_ni != 0 else 0
+                sa_cash        = sa_detail.get("cash", 0.0)
+                sa_gross_inv   = sa_detail.get("gross_investment") or (sa_cv - sa_cash)
                 sub_account_results.append({
                     "holder":           r["name"],
                     "label":            sa_label,
@@ -282,8 +284,8 @@ def main():
                     "current_value":    sa_cv,
                     "pnl":              sa_pnl,
                     "total_return":     sa_ret,
-                    "gross_investment": sa_detail.get("gross_investment", 0.0),
-                    "cash":             sa_detail.get("cash", 0.0),
+                    "gross_investment": sa_gross_inv,
+                    "cash":             sa_cash,
                 })
                 irr_str = f"{sa_irr*100:.2f}%" if sa_irr else "N/A"
                 print(f"  → {r['name']} / {sa_label}: XIRR={irr_str}  £{sa_cv:,.2f}")
@@ -293,7 +295,7 @@ def main():
                     "holder": r["name"], "label": sa_label,
                     "irr": None, "net_investment": None,
                     "current_value": None, "pnl": None, "total_return": None,
-                    "gross_investment": sa_detail.get("gross_investment", 0.0),
+                    "gross_investment": sa_detail.get("gross_investment") or None,
                     "cash":             sa_detail.get("cash", 0.0),
                 })
 
@@ -512,6 +514,36 @@ def main():
     except Exception as e:
         print(f"  ⚠  Google Sheets push failed (non-fatal): {e}")
 
+    # ── Local mirror of Sheets row ────────────────────────────────────────────
+    # Saves the same data that would be pushed to Sheets as a local CSV backup.
+    # Useful when Sheets is unavailable or for auditing discrepancies.
+    try:
+        from gsheets import _build_row
+        gsheets_log = SNAPSHOTS_DIR / "hm_gsheets_log.csv"
+        headers, values = _build_row(
+            snapshot_date       = date_str_gs,
+            net_investment      = net_investment,
+            current_value       = current_value,
+            pnl                 = pnl,
+            total_return        = total_return,
+            portfolio_twrr      = portfolio_twrr,
+            irr                 = irr_result,
+            account_results     = account_results,
+            sub_account_results = sub_account_results,
+            benchmarks          = benchmarks,
+            ticker_names        = TICKER_NAMES,
+        )
+        write_header = not gsheets_log.exists()
+        with open(gsheets_log, "a", newline="", encoding="utf-8") as f:
+            import csv as _csv
+            w = _csv.writer(f)
+            if write_header:
+                w.writerow(headers)
+            w.writerow(values)
+        print(f"  → Local Sheets mirror: {gsheets_log}")
+    except Exception as e:
+        print(f"  ⚠  Local Sheets mirror failed (non-fatal): {e}")
+
     # ── Step 7: Update PP index (daily incremental) ──────────────────────────
     step(7, "Updating Portfolio Performance index")
     try:
@@ -550,12 +582,14 @@ def main():
                 print("  ⚠  Could not compute PP NAV — skipping")
             else:
                 print(f"  → PP NAV today: {pp_nav:.6f}")
+                pp_full = "--pp-full" in sys.argv
                 daily_update(
                     work_dir             = HERE,
                     nav                  = pp_nav,
                     date_str             = now_dt.strftime("%Y-%m-%d"),
                     account_values       = acct_vals,
                     account_net_invested = acct_ni,
+                    full                 = pp_full,
                 )
     except Exception as e:
         import traceback

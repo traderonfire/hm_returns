@@ -53,6 +53,57 @@ def _get_sheet_id(svc, title: str) -> int:
     raise ValueError(f"Sheet tab '{title}' not found in spreadsheet")
 
 
+def _build_row(
+    *,
+    snapshot_date: str,
+    net_investment: float,
+    current_value:  float,
+    pnl:            float,
+    total_return:   float,
+    portfolio_twrr: float = None,
+    irr:            float,
+    account_results: list,
+    sub_account_results: list,
+    benchmarks: list,
+    ticker_names: dict = None,
+):
+    """Build the flat headers + values lists for one snapshot row."""
+    ticker_names = ticker_names or {}
+
+    def pct(v):  return round(v * 100, 4) if v is not None else ""
+    def gbp(v):  return round(v, 2)       if v is not None else ""
+
+    headers = ["Date", "Current Value", "Net Invested", "P&L",
+               "Total Return %", "TWRR %", "XIRR %"]
+    values  = [snapshot_date,
+               gbp(current_value), gbp(net_investment), gbp(pnl),
+               pct(total_return), pct(portfolio_twrr), pct(irr)]
+
+    for r in account_results:
+        headers.append(f"{r['name']} Balance")
+        values.append(gbp(r["balance"]))
+
+    for sa in sub_account_results:
+        prefix = f"{sa['holder']} {sa['label']}"
+        headers += [f"{prefix} Invested", f"{prefix} Cash",
+                    f"{prefix} Total", f"{prefix} P&L",
+                    f"{prefix} Return %", f"{prefix} XIRR %",
+                    f"{prefix} TWRR %"]
+        values  += [gbp(sa.get("gross_investment")), gbp(sa.get("cash")),
+                    gbp(sa.get("current_value")),    gbp(sa.get("pnl")),
+                    pct(sa.get("total_return")),     pct(sa.get("irr")),
+                    pct(sa.get("twrr"))]
+
+    for b in benchmarks:
+        name = ticker_names.get(b["ticker"], b["ticker"])
+        headers += [f"{name} Final Value", f"{name} P&L",
+                    f"{name} Return %",    f"{name} XIRR %"]
+        values  += [gbp(b.get("final_value")), gbp(b.get("pnl")),
+                    pct(b.get("total_return")), pct(b.get("irr"))]
+
+    return headers, values
+
+
 def push_results(
     *,
     snapshot_date: str,
@@ -61,6 +112,7 @@ def push_results(
     current_value:  float,
     pnl:            float,
     total_return:   float,
+    portfolio_twrr: float = None,
     irr:            float,
     # Per account holder (list of dicts)
     account_results: list,      # [{name, balance}]
@@ -81,41 +133,21 @@ def push_results(
     svc      = _get_service()
     sheets   = svc.spreadsheets()
     tab      = SHEET_NAME
-    ticker_names = ticker_names or {}
 
     # ── Build the flat row ────────────────────────────────────────────────────
-    def pct(v):  return round(v * 100, 4) if v is not None else ""
-    def gbp(v):  return round(v, 2)       if v is not None else ""
-
-    headers = ["Date", "Current Value", "Net Invested", "P&L",
-               "Total Return %", "XIRR %"]
-
-    values  = [snapshot_date,
-               gbp(current_value), gbp(net_investment), gbp(pnl),
-               pct(total_return), pct(irr)]
-
-    # Per account holder totals
-    for r in account_results:
-        headers.append(f"{r['name']} Balance")
-        values.append(gbp(r["balance"]))
-
-    # Per sub-account: invested, cash, total, P&L, return, XIRR
-    for sa in sub_account_results:
-        prefix = f"{sa['holder']} {sa['label']}"
-        headers += [f"{prefix} Invested", f"{prefix} Cash",
-                    f"{prefix} Total", f"{prefix} P&L",
-                    f"{prefix} Return %", f"{prefix} XIRR %"]
-        values  += [gbp(sa.get("gross_investment")), gbp(sa.get("cash")),
-                    gbp(sa.get("current_value")),    gbp(sa.get("pnl")),
-                    pct(sa.get("total_return")),     pct(sa.get("irr"))]
-
-    # Benchmark ETFs
-    for b in benchmarks:
-        name = ticker_names.get(b["ticker"], b["ticker"])
-        headers += [f"{name} Final Value", f"{name} P&L",
-                    f"{name} Return %",    f"{name} XIRR %"]
-        values  += [gbp(b.get("final_value")), gbp(b.get("pnl")),
-                    pct(b.get("total_return")), pct(b.get("irr"))]
+    headers, values = _build_row(
+        snapshot_date       = snapshot_date,
+        net_investment      = net_investment,
+        current_value       = current_value,
+        pnl                 = pnl,
+        total_return        = total_return,
+        portfolio_twrr      = portfolio_twrr,
+        irr                 = irr,
+        account_results     = account_results,
+        sub_account_results = sub_account_results,
+        benchmarks          = benchmarks,
+        ticker_names        = ticker_names,
+    )
 
     MAX_HISTORY = 50  # max data rows to keep (excluding header)
 
@@ -126,6 +158,19 @@ def push_results(
     ).execute().get("values", [])
 
     numeric_sheet_id = _get_sheet_id(svc, tab)
+
+    # ── Idempotency guard: skip if we already have a row for this date ────────
+    # Protects against duplicate rows when the pipeline runs more than once
+    # in a single day (e.g. NAS scheduler retries, manual re-runs).
+    if existing:
+        date_col = sheets.values().get(
+            spreadsheetId=SHEET_ID,
+            range=f"{tab}!A:A"
+        ).execute().get("values", [])
+        existing_dates = [r[0] for r in date_col[1:] if r]  # skip header
+        if snapshot_date in existing_dates:
+            print(f"  ℹ  '{tab}' already has a row for {snapshot_date} — skipping duplicate push")
+            return
 
     if not existing:
         # Write header row first
