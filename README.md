@@ -43,7 +43,8 @@ Generated at runtime:
 │   ├── hm_report_YYYYMMDD_HHMMSS.html  ← timestamped HTML report
 │   └── hm_report_latest.html           ← always the most recent
 └── snapshots/
-    └── hm_history.csv                  ← one row per run, grows over time
+    ├── hm_history.csv                  ← one row per run, grows over time
+    └── hm_gsheets_log.csv              ← local mirror of every Sheets push
 ```
 
 ---
@@ -122,7 +123,7 @@ python run.py --pp-full      # write PP transactions every day (default: cash-fl
 | 3 | Calculates portfolio XIRR; per-sub-account XIRR using scraped balance as current value; benchmark ETF XIRRs |
 | 4 | Produces a styled HTML report: XIRR headline, TWRR, HMFUND NAV, portfolio returns table, sub-account breakdown with TWRR and XIRR, benchmark comparison cards |
 | 5 | Appends one row to `snapshots/hm_history.csv` |
-| 6 | Pushes results to Google Sheets HM tab (rolling 50-run history, newest at top) |
+| 6 | Pushes results to Google Sheets HM tab (rolling 50-run history, newest at top); a local copy of the same row is also appended to `snapshots/hm_gsheets_log.csv` as a backup |
 | 7 | Updates HMFUND NAV quote and per-account transactions for Portfolio Performance |
 
 ---
@@ -167,7 +168,7 @@ After every run, results are pushed to a Google Sheet tab. Rolling 50-run histor
 4. Create a tab named `HM` (or set via `GSHEET_SHEET_NAME`)
 5. The Sheet ID is the long string in the URL: `https://docs.google.com/spreadsheets/d/`**`THIS_PART`**`/edit`
 
-The push is non-fatal — if it fails, the rest of the run completes normally.
+The push is non-fatal — if it fails, the rest of the run completes normally. A local copy of every pushed row is also saved to `snapshots/hm_gsheets_log.csv`, independent of whether the Sheets push succeeds, so you always have a local backup of this data.
 
 ---
 
@@ -346,7 +347,10 @@ Run with `--visible`. The account filter requires two selections (specific accou
 Check that the Current Value row is in column I (Cash change), not column J (Balance), in `ReportsTransactionAll.csv`.
 
 **Google Sheets push fails**
-Check `service_account.json` is present, the sheet is shared with the service account email (Editor), and `GSHEET_ID` / `GSHEET_SHEET_NAME` match. The error is non-fatal.
+Check `service_account.json` is present, the sheet is shared with the service account email (Editor), and `GSHEET_ID` / `GSHEET_SHEET_NAME` match. The error is non-fatal — the run still completes, and the same row is saved locally to `snapshots/hm_gsheets_log.csv` regardless.
+
+**Sub-account "Invested" shows £0 in Google Sheets or the report**
+The scraper's `gross_investment` field can occasionally return 0 if the "Gross investment" card isn't found on the dashboard. `run.py` falls back to `current_value - cash` in this case, which is always accurate. If you see this with an older run, it predates the fix.
 
 **PP transactions are wrong after a failed run**
 Restore `hm_pp_state.json` from `hm_pp_state.backup.json` (or from a row in `hm_pp_state_history.csv`), delete the bad transaction rows from the CSVs, and re-run.
